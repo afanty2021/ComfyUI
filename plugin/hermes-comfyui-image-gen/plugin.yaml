@@ -1,0 +1,5 @@
+name: comfyui-image-gen
+version: 1.0.0
+description: "Local ComfyUI image generation backend (Qwen-Image 2.1 / Z-Image Turbo). Runs on 127.0.0.1:8188 — no API key, no internet. Saves images to $HERMES_HOME/cache/images/."
+author: Berton
+kind: backend
