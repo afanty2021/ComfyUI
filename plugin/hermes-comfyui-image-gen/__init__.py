@@ -6,8 +6,8 @@ Turbo (fast drafts, ~1 min). Auto-starts ComfyUI when it is not running. No API
 key, no internet.
 
 Selection: ``model`` kwarg -> ``COMFYUI_IMAGE_MODEL`` -> ``image_gen.comfyui.model``
--> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` / ``COMFYUI_PYTHON`` env
-vars override defaults."""
+-> ``image_gen.model`` -> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` /
+``COMFYUI_PYTHON`` env vars override defaults."""
 
 from __future__ import annotations
 
