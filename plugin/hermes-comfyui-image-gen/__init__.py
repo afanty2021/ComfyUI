@@ -6,7 +6,8 @@ Turbo (fast drafts, ~1 min). Auto-starts ComfyUI when it is not running. No API
 key, no internet.
 
 Selection: ``model`` kwarg -> ``COMFYUI_IMAGE_MODEL`` -> ``image_gen.comfyui.model``
--> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` env vars override defaults."""
+-> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` / ``COMFYUI_PYTHON`` env
+vars override defaults."""
 
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import logging
 import os
 import random
 import subprocess
-import sys
+import threading
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -23,13 +24,16 @@ from typing import Any, Dict, List, Optional
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, success_response)
 from agent import provider_media
-from plugins.image_gen._common import StaticImageGenProvider, error_factory
+from plugins.image_gen._common import (
+    StaticImageGenProvider, error_factory, prompt_required_error, resolve_static_model)
 
 logger = logging.getLogger(__name__)
 
 COMFY_DIR = os.path.expanduser(os.environ.get("COMFYUI_DIR", "~/Github/AI-Infra/ComfyUI"))
 COMFY_PORT = os.environ.get("COMFYUI_PORT", "8188")
 SERVER = f"http://127.0.0.1:{COMFY_PORT}"
+# the gateway interpreter has no torch; boot ComfyUI with the interpreter it is installed for
+COMFY_PYTHON = os.environ.get("COMFYUI_PYTHON", "python3")
 
 _MODELS: Dict[str, Dict[str, Any]] = {
     "qwen21": {
@@ -68,6 +72,9 @@ def _http_json(path: str, payload: Any = None, timeout: float = 30) -> Any:
         return json.load(resp)
 
 
+_START_LOCK = threading.Lock()
+
+
 def _ensure_server(attempt_start: bool = True) -> None:
     try:
         _http_json("/system_stats", timeout=5)
@@ -76,17 +83,23 @@ def _ensure_server(attempt_start: bool = True) -> None:
         if not attempt_start:
             raise RuntimeError(f"ComfyUI not running ({SERVER})")
     logger.info("ComfyUI not running, auto-starting…")
-    log = open(os.path.join(COMFY_DIR, "comfyui-boot.log"), "ab")
-    subprocess.Popen([sys.executable, "main.py", "--port", COMFY_PORT], cwd=COMFY_DIR,
-                     stdout=log, stderr=log, start_new_session=True)
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        time.sleep(2)
-        try:
+    with _START_LOCK:
+        try:  # a concurrent turn may have finished starting it while we waited
             _http_json("/system_stats", timeout=5)
             return
         except Exception:
             pass
+        with open(os.path.join(COMFY_DIR, "comfyui-boot.log"), "ab") as log:
+            subprocess.Popen([COMFY_PYTHON, "main.py", "--port", COMFY_PORT], cwd=COMFY_DIR,
+                             stdout=log, stderr=log, start_new_session=True)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                _http_json("/system_stats", timeout=5)
+                return
+            except Exception:
+                pass
     raise RuntimeError(f"ComfyUI auto-start failed, see {COMFY_DIR}/comfyui-boot.log")
 
 
@@ -125,8 +138,8 @@ def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: i
 
 
 def _resolve_model(explicit: Optional[str]) -> str:
-    candidate = (explicit or os.environ.get("COMFYUI_IMAGE_MODEL") or "").strip()
-    return candidate if candidate in _MODELS else DEFAULT_MODEL
+    return resolve_static_model(_MODELS, DEFAULT_MODEL, env_var="COMFYUI_IMAGE_MODEL",
+                                config_key="comfyui", explicit=explicit)[0]
 
 
 class ComfyuiImageGenProvider(StaticImageGenProvider):
@@ -139,12 +152,10 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
     setup = {"name": "ComfyUI (local)", "badge": "local",
              "tag": "Local ComfyUI text-to-image, no key, no internet", "env_vars": []}
 
-    def is_available(self) -> bool:
-        try:
-            _http_json("/system_stats", timeout=3)
-            return True
-        except Exception:
-            return False
+    def get_setup_schema(self) -> Dict[str, Any]:
+        # base StaticImageGenProvider routes through api_key_setup_schema, which is for
+        # single-env-var auth; this dict is already in the ProviderBase schema shape
+        return dict(self.setup)
 
     def capabilities(self) -> Dict[str, Any]:
         return {"modalities": ["text"], "max_reference_images": 0}
@@ -157,7 +168,7 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         if not prompt:
-            return error_factory("comfyui", aspect)("prompt is empty", "invalid_prompt")
+            return prompt_required_error("comfyui", aspect)
         model_id = _resolve_model(kwargs.get("model"))
         width, height = _SIZES.get(aspect, _SIZES["square"])
         seed = random.randint(0, 2**48 - 1)
@@ -171,9 +182,17 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
             if not pid:
                 return fail(f"ComfyUI submit failed: {resp}", "api_error")
             deadline = time.time() + 900
+            misses = 0
             while time.time() < deadline:
                 time.sleep(5)
-                hist = _http_json(f"/history/{pid}")
+                try:
+                    hist = _http_json(f"/history/{pid}")
+                except Exception:  # transient blips must not kill a multi-minute job
+                    misses += 1
+                    if misses >= 3:
+                        raise
+                    continue
+                misses = 0
                 if pid not in hist:
                     continue
                 entry = hist[pid]

@@ -40,6 +40,7 @@ image_gen:
 |---|---|---|
 | `COMFYUI_DIR` | `~/Github/AI-Infra/ComfyUI` | ComfyUI 仓库位置(自动启动时使用) |
 | `COMFYUI_PORT` | `8188` | API 端口 |
-| `COMFYUI_IMAGE_MODEL` | `qwen21` | 默认模型,可被每次调用的 `model` 参数覆盖 |
+| `COMFYUI_PYTHON` | `python3` | 自动启动用的解释器(网关解释器未必装有 torch) |
+| `COMFYUI_IMAGE_MODEL` | 未设置 | 模型优先级:调用 `model` 参数 > 此变量 > `image_gen.comfyui.model` 配置 > `qwen21` |
 
 ComfyUI 未运行时插件会自动以 `python3 main.py --port <COMFYUI_PORT>` 拉起,日志写 `<COMFYUI_DIR>/comfyui-boot.log`。
