@@ -221,25 +221,27 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
             return fail(f"{model_id} does not support reference images; use qwen21",
                         "invalid_argument")
         try:
+            # read local files before starting ComfyUI so a bad path fails fast
+            uploads = []
+            for src in sources:
+                try:
+                    with open(os.path.expanduser(src), "rb") as f:
+                        uploads.append((f.read(), os.path.splitext(src)[1] or ".png"))
+                except OSError as exc:
+                    return fail(f"Cannot read reference image {src}: {exc.strerror}",
+                                "invalid_argument")
             _ensure_server()
             reference_names = None
-            if sources:
-                reference_names = []
-                for i, src in enumerate(sources, start=1):
-                    try:
-                        with open(os.path.expanduser(src), "rb") as f:
-                            data = f.read()
-                    except OSError as exc:
-                        return fail(f"Cannot read reference image {src}: {exc.strerror}",
-                                    "invalid_argument")
-                    ext = os.path.splitext(src)[1] or ".png"
-                    reference_names.append(_upload_image(data, f"hermes_ref_{int(t0)}_{i}{ext}"))
+            if uploads:
+                reference_names = [_upload_image(data, f"hermes_ref_{int(t0)}_{i}{ext}")
+                                   for i, (data, ext) in enumerate(uploads, start=1)]
             try:
                 resp = _http_json("/prompt", {"prompt": _build_workflow(
                     prompt, model_id, width, height, seed, reference_names)})
             except urllib.error.HTTPError as exc:
                 # validation failures come back as 400 with a node_errors body
-                return fail(f"ComfyUI submit failed: {exc.read().decode(errors='replace')}",
+                body = exc.read().decode(errors="replace").strip()
+                return fail(f"ComfyUI submit failed ({exc.code}): {body or exc.reason}",
                             "api_error")
             pid = resp.get("prompt_id")
             if not pid:
