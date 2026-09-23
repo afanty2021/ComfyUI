@@ -9,6 +9,8 @@
 | `qwen21`(默认) | ~4-6 分钟 | 最高质量;图内中英文文字渲染;海报 |
 | `zimage` | ~1 分钟 | 快速草稿、构图迭代 |
 
+尺寸:默认三档(square 1024² / landscape 1344×768 / portrait 768×1344,跟随 `aspect_ratio`)。`image_generate` 也接受 `width`/`height`(声明了 `supports_custom_size` 能力的后端才会广告该参数),自动对齐到 32 的倍数;自定义尺寸渲染时间按像素量增长(2K 约 15-17 分钟),插件轮询上限相应放宽到 1800s。
+
 要求 ComfyUI 的 `models/` 下已链接对应模型文件(diffusion_models / text_encoders / vae),且 ComfyUI 版本支持 Qwen-Image 2.1 与 Z-Image(本仓库 v0.36+)。
 
 ## 安装

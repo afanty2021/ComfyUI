@@ -158,19 +158,26 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
         return dict(self.setup)
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"modalities": ["text"], "max_reference_images": 0}
+        return {"modalities": ["text"], "max_reference_images": 0, "supports_custom_size": True}
 
     def generate(
         self, prompt: str, aspect_ratio: str = DEFAULT_ASPECT_RATIO, *,
         image_url: Optional[str] = None, reference_image_urls: Optional[List[str]] = None,
-        **kwargs: Any,
+        width: Optional[int] = None, height: Optional[int] = None, **kwargs: Any,
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         if not prompt:
             return prompt_required_error("comfyui", aspect)
         model_id = _resolve_model(kwargs.get("model"))
-        width, height = _SIZES.get(aspect, _SIZES["square"])
+        if isinstance(width, (int, float)) and isinstance(height, (int, float)) \
+                and width > 0 and height > 0:
+            # snap to multiples of 32 as Qwen 2.1 requires
+            width, height = round(width / 32) * 32, round(height / 32) * 32
+            timeout = 1800  # 2K-class renders need ~2x the preset budget
+        else:
+            width, height = _SIZES.get(aspect, _SIZES["square"])
+            timeout = 900
         seed = random.randint(0, 2**48 - 1)
         t0 = time.time()
         fail = error_factory("comfyui", aspect, model=model_id, prompt=prompt)
@@ -181,7 +188,7 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
             pid = resp.get("prompt_id")
             if not pid:
                 return fail(f"ComfyUI submit failed: {resp}", "api_error")
-            deadline = time.time() + 900
+            deadline = time.time() + timeout
             misses = 0
             while time.time() < deadline:
                 time.sleep(5)
@@ -216,7 +223,7 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
                             extra={"seed": seed, "seconds": round(time.time() - t0),
                                    "size": f"{width}x{height}"})
                 return fail("ComfyUI finished without an output image", "empty_response")
-            return fail("ComfyUI generation timed out (>900s)", "timeout")
+            return fail(f"ComfyUI generation timed out (>{timeout}s)", "timeout")
         except Exception as exc:
             logger.debug("ComfyUI generation failed", exc_info=True)
             return fail(f"ComfyUI generation failed: {exc}", "api_error")
