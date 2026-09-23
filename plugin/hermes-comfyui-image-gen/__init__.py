@@ -7,7 +7,8 @@ key, no internet.
 
 Selection: ``model`` kwarg -> ``COMFYUI_IMAGE_MODEL`` -> ``image_gen.comfyui.model``
 -> ``image_gen.model`` -> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` /
-``COMFYUI_PYTHON`` env vars override defaults."""
+``COMFYUI_PYTHON`` env vars override defaults. Reference images (``image_url`` /
+``reference_image_urls``, local paths) switch Qwen-Image 2.1 into edit mode."""
 
 from __future__ import annotations
 
@@ -103,7 +104,23 @@ def _ensure_server(attempt_start: bool = True) -> None:
     raise RuntimeError(f"ComfyUI auto-start failed, see {COMFY_DIR}/comfyui-boot.log")
 
 
-def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: int) -> Dict[str, Any]:
+def _upload_image(data: bytes, filename: str) -> str:
+    boundary = "----hermes-comfyui-" + str(random.randint(10**8, 10**9))
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + data \
+        + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(SERVER + "/upload/image", body,
+                                 {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        name = json.load(resp).get("name")
+    if not name:
+        raise RuntimeError("ComfyUI image upload failed")
+    return name
+
+
+def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: int,
+                    reference_names: Optional[List[str]] = None) -> Dict[str, Any]:
     s = _MODEL_SETTINGS[model_id]
     wf: Dict[str, Any] = {
         "1": {"class_type": "UNETLoader",
@@ -118,19 +135,32 @@ def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: i
                    "inputs": {"model": model_src, "shift": s["auraflow_shift"]}}
         model_src = ["8", 0]
     if model_id == "qwen21":
-        wf["4"] = {"class_type": "TextEncodeQwenImage21",
-                   "inputs": {"clip": ["2", 0], "prompt": prompt, "negative_prompt": "",
-                              "resolution": min(width, height)}}
+        node4: Dict[str, Any] = {"clip": ["2", 0], "prompt": prompt, "negative_prompt": "",
+                                 "resolution": min(width, height)}
+        if reference_names:
+            # edit mode: refs feed the vision tower and become reference latents;
+            # the node's third output is an empty latent sized from the first ref.
+            # Autogrow inputs are addressed by their prefixed name in the prompt API.
+            node4["vae"] = ["3", 0]
+            for i in range(1, len(reference_names) + 1):
+                node4[f"images.image_{i}"] = [f"ref{i}", 0]
+        wf["4"] = {"class_type": "TextEncodeQwenImage21", "inputs": node4}
         positive, negative = ["4", 0], ["4", 1]
     else:
         wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}}
         wf["5"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}}
         positive, negative = ["4", 0], ["5", 0]
-    wf["9"] = {"class_type": "EmptyLatentImage" if model_id == "qwen21" else "EmptySD3LatentImage",
-               "inputs": {"width": width, "height": height, "batch_size": 1}}
+    if reference_names:
+        latent = ["4", 2]
+        for i, name in enumerate(reference_names, start=1):
+            wf[f"ref{i}"] = {"class_type": "LoadImage", "inputs": {"image": name}}
+    else:
+        latent = ["9", 0]
+        wf["9"] = {"class_type": "EmptyLatentImage" if model_id == "qwen21" else "EmptySD3LatentImage",
+                   "inputs": {"width": width, "height": height, "batch_size": 1}}
     wf["6"] = {"class_type": "KSampler",
                "inputs": {"model": model_src, "positive": positive, "negative": negative,
-                          "latent_image": ["9", 0], "seed": seed, "steps": s["steps"], "cfg": 1.0,
+                          "latent_image": latent, "seed": seed, "steps": s["steps"], "cfg": 1.0,
                           "sampler_name": s["sampler"], "scheduler": "simple", "denoise": 1.0}}
     wf["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}}
     wf["7"] = {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": "hermes_comfyui"}}
@@ -158,7 +188,8 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
         return dict(self.setup)
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"modalities": ["text"], "max_reference_images": 0, "supports_custom_size": True}
+        return {"modalities": ["text", "image"], "max_reference_images": 4,
+                "supports_custom_size": True}
 
     def generate(
         self, prompt: str, aspect_ratio: str = DEFAULT_ASPECT_RATIO, *,
@@ -181,10 +212,24 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
         seed = random.randint(0, 2**48 - 1)
         t0 = time.time()
         fail = error_factory("comfyui", aspect, model=model_id, prompt=prompt)
+        sources = [image_url, *(reference_image_urls or [])]
+        sources = [s.strip() for s in sources if isinstance(s, str) and s.strip()]
+        if any(s.lower().startswith(("http://", "https://", "data:")) for s in sources):
+            return fail("Reference images must be local file paths", "invalid_argument")
+        if sources and model_id != "qwen21":
+            return fail(f"{model_id} does not support reference images; use qwen21",
+                        "invalid_argument")
         try:
             _ensure_server()
+            reference_names = None
+            if sources:
+                reference_names = []
+                for i, src in enumerate(sources, start=1):
+                    with open(os.path.expanduser(src), "rb") as f:
+                        data = f.read()
+                    reference_names.append(_upload_image(data, f"hermes_ref_{int(t0)}_{i}.png"))
             resp = _http_json("/prompt", {"prompt": _build_workflow(
-                prompt, model_id, width, height, seed)})
+                prompt, model_id, width, height, seed, reference_names)})
             pid = resp.get("prompt_id")
             if not pid:
                 return fail(f"ComfyUI submit failed: {resp}", "api_error")
@@ -219,6 +264,7 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
                                                          extension="png")
                         return success_response(
                             image=str(path), model=model_id, prompt=prompt, aspect_ratio=aspect,
+                            modality="image" if reference_names else "text",
                             provider="comfyui",
                             extra={"seed": seed, "seconds": round(time.time() - t0),
                                    "size": f"{width}x{height}"})
