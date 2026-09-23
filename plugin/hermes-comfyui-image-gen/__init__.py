@@ -19,6 +19,7 @@ import random
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -225,11 +226,21 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
             if sources:
                 reference_names = []
                 for i, src in enumerate(sources, start=1):
-                    with open(os.path.expanduser(src), "rb") as f:
-                        data = f.read()
-                    reference_names.append(_upload_image(data, f"hermes_ref_{int(t0)}_{i}.png"))
-            resp = _http_json("/prompt", {"prompt": _build_workflow(
-                prompt, model_id, width, height, seed, reference_names)})
+                    try:
+                        with open(os.path.expanduser(src), "rb") as f:
+                            data = f.read()
+                    except OSError as exc:
+                        return fail(f"Cannot read reference image {src}: {exc.strerror}",
+                                    "invalid_argument")
+                    ext = os.path.splitext(src)[1] or ".png"
+                    reference_names.append(_upload_image(data, f"hermes_ref_{int(t0)}_{i}{ext}"))
+            try:
+                resp = _http_json("/prompt", {"prompt": _build_workflow(
+                    prompt, model_id, width, height, seed, reference_names)})
+            except urllib.error.HTTPError as exc:
+                # validation failures come back as 400 with a node_errors body
+                return fail(f"ComfyUI submit failed: {exc.read().decode(errors='replace')}",
+                            "api_error")
             pid = resp.get("prompt_id")
             if not pid:
                 return fail(f"ComfyUI submit failed: {resp}", "api_error")
@@ -262,12 +273,15 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
                         raw = urllib.request.urlopen(SERVER + url, timeout=120).read()
                         path = provider_media.save_bytes("images", raw, prefix="comfyui",
                                                          extension="png")
+                        # in edit mode the node sizes the output from the first reference
+                        # image, not from width/height, so the requested size would lie
+                        extra = {"seed": seed, "seconds": round(time.time() - t0)}
+                        if not reference_names:
+                            extra["size"] = f"{width}x{height}"
                         return success_response(
                             image=str(path), model=model_id, prompt=prompt, aspect_ratio=aspect,
                             modality="image" if reference_names else "text",
-                            provider="comfyui",
-                            extra={"seed": seed, "seconds": round(time.time() - t0),
-                                   "size": f"{width}x{height}"})
+                            provider="comfyui", extra=extra)
                 return fail("ComfyUI finished without an output image", "empty_response")
             return fail(f"ComfyUI generation timed out (>{timeout}s)", "timeout")
         except Exception as exc:

@@ -9,7 +9,7 @@
 | `qwen21`(默认) | ~4-6 分钟 | 最高质量;图内中英文文字渲染;海报 |
 | `zimage` | ~1 分钟 | 快速草稿、构图迭代 |
 
-尺寸:默认三档(square 1024² / landscape 1344×768 / portrait 768×1344,跟随 `aspect_ratio`)。`image_generate` 也接受 `width`/`height`(声明了 `supports_custom_size` 能力的后端才会广告该参数),自动对齐到 32 的倍数;自定义尺寸渲染时间按像素量增长(2K 约 15-17 分钟),插件轮询上限相应放宽到 1800s。
+尺寸:默认三档(square 1024² / landscape 1344×768 / portrait 768×1344,跟随 `aspect_ratio`)。`image_generate` 也接受 `width`/`height`(声明了 `supports_custom_size` 能力的后端才会广告该参数),自动对齐到 32 的倍数;自定义尺寸渲染时间按像素量增长(2K 约 15-17 分钟),插件轮询上限相应放宽到 1800s。编辑模式下 `width`/`height` 语义不同:仅作为参考图重采样的分辨率(`min(width, height)`),实际输出尺寸跟随第一张参考图(即 `image_url`),因此编辑成功的响应不携带 `size` 字段。
 
 参考图:`qwen21` 原生支持编辑模式(声明 `modalities: ["text","image"]` + `max_reference_images: 4`)——传 `image_url`(待编辑图,决定输出尺寸)与最多 3 张 `reference_image_urls`,插件把图片上传到 ComfyUI input 后经 `TextEncodeQwenImage21` 的参考 latent 通道生成;仅支持本地路径。
 
