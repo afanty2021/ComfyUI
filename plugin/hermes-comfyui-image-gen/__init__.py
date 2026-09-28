@@ -120,6 +120,13 @@ def _upload_image(data: bytes, filename: str) -> str:
     return name
 
 
+def _free_memory() -> None:
+    try:
+        _http_json("/free", {"unload_models": True, "free_memory": True})
+    except Exception:
+        logger.debug("ComfyUI /free failed", exc_info=True)
+
+
 def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: int,
                     reference_names: Optional[List[str]] = None) -> Dict[str, Any]:
     s = _MODEL_SETTINGS[model_id]
@@ -275,6 +282,8 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
                         raw = urllib.request.urlopen(SERVER + url, timeout=120).read()
                         path = provider_media.save_bytes("images", raw, prefix="comfyui",
                                                          extension="png")
+                        # free only after success — failed rounds stay warm for retries
+                        _free_memory()
                         # in edit mode the node sizes the output from the first reference
                         # image, not from width/height, so the requested size would lie
                         extra = {"seed": seed, "seconds": round(time.time() - t0)}

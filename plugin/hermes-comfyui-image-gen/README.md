@@ -47,4 +47,4 @@ image_gen:
 | `COMFYUI_PYTHON` | `python3` | 自动启动用的解释器(网关解释器未必装有 torch) |
 | `COMFYUI_IMAGE_MODEL` | 未设置 | 模型优先级:调用 `model` 参数 > 此变量 > `image_gen.comfyui.model` > `image_gen.model` > `qwen21` |
 
-ComfyUI 未运行时插件会自动以 `$COMFYUI_PYTHON main.py --port <COMFYUI_PORT>` 拉起,日志写 `<COMFYUI_DIR>/comfyui-boot.log`。
+ComfyUI 未运行时插件会自动以 `$COMFYUI_PYTHON main.py --port <COMFYUI_PORT>` 拉起,日志写 `<COMFYUI_DIR>/comfyui-boot.log`。每次生成成功后插件调用 `/free` 卸载模型、归还内存;生成失败不卸载,保留热缓存便于立即重试——代价是每次成功生成后下一张需重新加载模型(约 +1 分钟)。
