@@ -7,7 +7,10 @@
 | model id | 速度 | 适用 |
 |---|---|---|
 | `qwen21`(默认) | ~4-6 分钟 | 最高质量;图内中英文文字渲染;海报 |
+| `qwen21-turbo` | ~2 分钟 | qwen21 的 6 步 viggle 蒸馏版;文生图接近原版,密集小字略逊,编辑能力稍弱 |
 | `zimage` | ~1 分钟 | 快速草稿、构图迭代 |
+
+`qwen21-turbo` 基于 Viggle/Qwen-Image-2.1-viggle-turbo(r128 LoRA,t8star ComfyUI 转换版):必须搭配 bf16 DiT 底模(`qwen_image_2.1_bf16.safetensors`),经 `LoraLoaderBypassModelOnly` 前向时打 patch(非合并,避免 bf16 精度损失),KV 前缀缓存固定 off,固定 6 步无 CFG 的 sigma 日程(随分辨率自适应)。文本编码器/VAE 与 `qwen21` 共用。编辑模式与 `qwen21` 相同(reference images ≤4),但蒸馏后多主体/换脸类编辑更容易出残影,要求高时回退 `qwen21`。
 
 尺寸:默认三档(square 1024² / landscape 1344×768 / portrait 768×1344,跟随 `aspect_ratio`)。`image_generate` 也接受 `width`/`height`(声明了 `supports_custom_size` 能力的后端才会广告该参数),自动对齐到 32 的倍数;自定义尺寸渲染时间按像素量增长(2K 约 15-17 分钟),插件轮询上限相应放宽到 1800s。编辑模式下 `width`/`height` 语义不同:仅作为参考图重采样的分辨率(`min(width, height)`),实际输出尺寸跟随第一张参考图(即 `image_url`),因此编辑成功的响应不携带 `size` 字段。
 

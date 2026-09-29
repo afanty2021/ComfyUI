@@ -1,19 +1,20 @@
 """Hermes image_gen provider plugin: local ComfyUI text-to-image backend.
 
-Talks to the ComfyUI HTTP API (default ``127.0.0.1:8188``) and generates with two
-local models: Qwen-Image 2.1 (quality / in-image CJK text, ~4-6 min) and Z-Image
-Turbo (fast drafts, ~1 min). Auto-starts ComfyUI when it is not running. No API
-key, no internet.
+Talks to the ComfyUI HTTP API (default ``127.0.0.1:8188``) and generates with three
+local models: Qwen-Image 2.1 (quality / in-image CJK text, ~4-6 min), Qwen-Image
+2.1 Turbo (6-step viggle distill of qwen21, ~1 min) and Z-Image Turbo (fast drafts,
+~1 min). Auto-starts ComfyUI when it is not running. No API key, no internet.
 
 Selection: ``model`` kwarg -> ``COMFYUI_IMAGE_MODEL`` -> ``image_gen.comfyui.model``
 -> ``image_gen.model`` -> default. Server: ``COMFYUI_DIR`` / ``COMFYUI_PORT`` /
 ``COMFYUI_PYTHON`` env vars override defaults. Reference images (``image_url`` /
-``reference_image_urls``, local paths) switch Qwen-Image 2.1 into edit mode."""
+``reference_image_urls``, local paths) switch the qwen21 models into edit mode."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import subprocess
@@ -44,6 +45,12 @@ _MODELS: Dict[str, Dict[str, Any]] = {
         "strengths": "Highest quality; best in-image CJK/English text rendering; posters",
         "price": "local/free",
     },
+    "qwen21-turbo": {
+        "display": "Qwen-Image 2.1 Turbo (local)",
+        "speed": "~2 min",
+        "strengths": "6-step viggle distill of qwen21; near-base t2i quality and CJK text, lighter editing",
+        "price": "local/free",
+    },
     "zimage": {
         "display": "Z-Image Turbo (local)",
         "speed": "~1 min",
@@ -59,12 +66,20 @@ _SIZES = {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 13
 _MODEL_SETTINGS = {
     "qwen21": {"unet": "qwen_image_2.1_int8_convrot.safetensors",
                "steps": 25, "sampler": "euler", "auraflow_shift": None},
+    # turbo requires the bf16 DiT: the int8 fused-MLP path skips the bypass hooks
+    "qwen21-turbo": {"unet": "qwen_image_2.1_bf16.safetensors",
+                     "lora": "qwen_image_2.1_viggle_turbo_v0.2.1_r128_comfy.safetensors",
+                     "sampler": "euler"},
     "zimage": {"unet": "z_image_turbo_bf16.safetensors",
                "steps": 8, "sampler": "res_multistep", "auraflow_shift": 3},
 }
-_CLIP = {"qwen21": "qwen3vl_8b_int8_convrot.safetensors", "zimage": "qwen_3_4b_fp8_mixed.safetensors"}
-_CLIP_TYPE = {"qwen21": "qwen_image", "zimage": "lumina2"}
-_VAE = {"qwen21": "qwen_image_2.1_vae_bf16.safetensors", "zimage": "z_image_turbo_ae.safetensors"}
+_CLIP = {"qwen21": "qwen3vl_8b_int8_convrot.safetensors",
+         "qwen21-turbo": "qwen3vl_8b_int8_convrot.safetensors",
+         "zimage": "qwen_3_4b_fp8_mixed.safetensors"}
+_CLIP_TYPE = {"qwen21": "qwen_image", "qwen21-turbo": "qwen_image", "zimage": "lumina2"}
+_VAE = {"qwen21": "qwen_image_2.1_vae_bf16.safetensors",
+        "qwen21-turbo": "qwen_image_2.1_vae_bf16.safetensors",
+        "zimage": "z_image_turbo_ae.safetensors"}
 
 
 def _http_json(path: str, payload: Any = None, timeout: float = 30) -> Any:
@@ -127,9 +142,89 @@ def _free_memory() -> None:
         logger.debug("ComfyUI /free failed", exc_info=True)
 
 
+# viggle turbo v0.2.1: fixed 6-step schedule, t values from the shipped workflow
+_TURBO_TS = (0.9375, 0.875, 0.75, 0.5, 0.25)
+
+
+def _turbo_sigmas(width: int, height: int) -> str:
+    # the workflow's resolution-adaptive sigma scale: a = e^(0.5 + 0.4*(latent_px-256)/7936),
+    # sigma(t) = a / (a + 1/t - 1); latent is 64ch at /16 spatial for Qwen 2.1
+    a = math.exp(0.5 + 0.4 * ((width // 16) * (height // 16) - 256) / 7936)
+    return "1, " + ", ".join(f"{a / (a + 1 / t - 1):.10f}" for t in _TURBO_TS) + ", 0"
+
+
+def _build_turbo_workflow(prompt: str, s: Dict[str, Any], width: int, height: int, seed: int,
+                          reference_names: Optional[List[str]] = None) -> Dict[str, Any]:
+    wf: Dict[str, Any] = {
+        # bypass applies the lora per forward pass, so the KV prefix cache must stay off
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": s["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "LoraLoaderBypassModelOnly",
+              "inputs": {"model": ["1", 0], "lora_name": s["lora"], "strength_model": 1.0}},
+        "3": {"class_type": "QwenImage21Cache",
+              "inputs": {"model": ["2", 0], "device": "off", "dtype": "default"}},
+        "4": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": _CLIP["qwen21-turbo"], "type": _CLIP_TYPE["qwen21-turbo"],
+                         "device": "default"}},
+        "5": {"class_type": "VAELoader", "inputs": {"vae_name": _VAE["qwen21-turbo"]}},
+        "6": {"class_type": "TextEncodeQwenImage21",
+              "inputs": {"clip": ["4", 0], "prompt": prompt, "negative_prompt": "",
+                         "resolution": min(width, height)}},
+    }
+    if reference_names:
+        wf["6"]["inputs"]["vae"] = ["5", 0]
+        for i, name in enumerate(reference_names, start=1):
+            wf["6"]["inputs"][f"images.image_{i}"] = [f"ref{i}", 0]
+            wf[f"ref{i}"] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        # edit latent is sized from the first ref at runtime, so the sigma scale is
+        # computed in-graph from node 6's latent output (shipped workflow's approach)
+        wf["7"] = {"class_type": "StringFormat",
+                   "inputs": {"values.a": ["6", 2],
+                              "f_string": "a ** (0.5 + 0.4 * ({a[samples].shape[2]} * "
+                                          "{a[samples].shape[3]} - 256) / 7936)"}}
+        wf["8"] = {"class_type": "PrimitiveFloat", "inputs": {"value": math.e}}
+        wf["9"] = {"class_type": "ComfyMathExpression",
+                   "inputs": {"expression": ["7", 0], "values.a": ["8", 0]}}
+        for i, t in enumerate(_TURBO_TS):
+            wf[str(10 + i)] = {"class_type": "ComfyMathExpression",
+                               "inputs": {"expression": f"a / (a + 1 / {t} - 1)",
+                                          "values.a": ["9", 0]}}
+        wf["15"] = {"class_type": "StringFormat",
+                    "inputs": {"values.a": ["10", 0], "values.b": ["11", 0], "values.c": ["12", 0],
+                               "values.d": ["13", 0], "values.e": ["14", 0],
+                               "f_string": "1, {a:.10f}, {b:.10f}, {c:.10f}, {d:.10f}, {e:.10f}, 0"}}
+        wf["16"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": ["15", 0]}}
+        sigmas, latent, nid = ["16", 0], ["6", 2], 17
+    else:
+        wf["7"] = {"class_type": "ManualSigmas",
+                   "inputs": {"sigmas": _turbo_sigmas(width, height)}}
+        sigmas, latent, nid = ["7", 0], None, 8
+    if latent is None:
+        wf[str(nid)] = {"class_type": "EmptyLatentImage",
+                        "inputs": {"width": width, "height": height, "batch_size": 1}}
+        latent = [str(nid), 0]
+        nid += 1
+    wf[str(nid)] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
+    wf[str(nid + 1)] = {"class_type": "KSamplerSelect",
+                        "inputs": {"sampler_name": s["sampler"]}}
+    wf[str(nid + 2)] = {"class_type": "BasicGuider",
+                        "inputs": {"model": ["3", 0], "conditioning": ["6", 0]}}
+    wf[str(nid + 3)] = {"class_type": "SamplerCustomAdvanced",
+                        "inputs": {"noise": [str(nid), 0], "guider": [str(nid + 2), 0],
+                                   "sampler": [str(nid + 1), 0], "sigmas": sigmas,
+                                   "latent_image": latent}}
+    wf[str(nid + 4)] = {"class_type": "VAEDecode",
+                        "inputs": {"samples": [str(nid + 3), 0], "vae": ["5", 0]}}
+    wf[str(nid + 5)] = {"class_type": "SaveImage",
+                        "inputs": {"images": [str(nid + 4), 0], "filename_prefix": "hermes_comfyui"}}
+    return wf
+
+
 def _build_workflow(prompt: str, model_id: str, width: int, height: int, seed: int,
                     reference_names: Optional[List[str]] = None) -> Dict[str, Any]:
     s = _MODEL_SETTINGS[model_id]
+    if s.get("lora"):
+        return _build_turbo_workflow(prompt, s, width, height, seed, reference_names)
     wf: Dict[str, Any] = {
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": s["unet"], "weight_dtype": "default"}},
@@ -224,7 +319,7 @@ class ComfyuiImageGenProvider(StaticImageGenProvider):
         sources = [s.strip() for s in sources if isinstance(s, str) and s.strip()]
         if any(s.lower().startswith(("http://", "https://", "data:")) for s in sources):
             return fail("Reference images must be local file paths", "invalid_argument")
-        if sources and model_id != "qwen21":
+        if sources and not model_id.startswith("qwen21"):
             return fail(f"{model_id} does not support reference images; use qwen21",
                         "invalid_argument")
         try:
