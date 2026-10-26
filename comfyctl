@@ -1,0 +1,50 @@
+#!/bin/bash
+# On-demand control for the local ComfyUI instance on :8188.
+# usage: comfyctl {start|stop|status|restart}
+set -u
+cd "$(dirname "$0")"
+
+PORT=8188
+LOG=comfyui-boot.log
+PIDFILE=.comfyui.pid
+
+up() { curl -s -m 2 "http://127.0.0.1:$PORT/system_stats" > /dev/null 2>&1; }
+
+case "${1:-}" in
+  start)
+    if up; then echo "ComfyUI already running on :$PORT"; exit 0; fi
+    nohup .venv/bin/python main.py --port $PORT >> $LOG 2>&1 &
+    echo $! > $PIDFILE
+    for i in $(seq 1 120); do
+      if up; then echo "ComfyUI up on :$PORT (took ${i}s)"; exit 0; fi
+      sleep 1
+    done
+    echo "ComfyUI failed to start; last lines of $LOG:" >&2
+    tail -5 $LOG >&2
+    exit 1
+    ;;
+  stop)
+    if [ -f $PIDFILE ]; then
+      kill "$(cat $PIDFILE)" 2>/dev/null
+      rm -f $PIDFILE
+    else
+      pkill -f "main.py --port $PORT" 2>/dev/null
+    fi
+    echo "ComfyUI stopped"
+    ;;
+  status)
+    if up; then
+      curl -s "http://127.0.0.1:$PORT/system_stats" | .venv/bin/python -c \
+        "import json,sys; d=json.load(sys.stdin)['system']; print('running: ComfyUI', d['comfyui_version'], 'on :$PORT')"
+    else
+      echo "stopped"
+    fi
+    ;;
+  restart)
+    "$0" stop; sleep 2; "$0" start
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status|restart}" >&2
+    exit 1
+    ;;
+esac
